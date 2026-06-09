@@ -1,0 +1,93 @@
+export class WanderlogError extends Error {
+    code;
+    hint;
+    followUps;
+    constructor(message, code, hintOrOptions) {
+        super(message);
+        this.name = "WanderlogError";
+        this.code = code;
+        if (typeof hintOrOptions === "string") {
+            this.hint = hintOrOptions;
+        }
+        else if (hintOrOptions) {
+            this.hint = hintOrOptions.hint;
+            this.followUps = hintOrOptions.followUps;
+        }
+    }
+    /**
+     * Render the error for the calling agent. Includes the hint (human advice)
+     * and a "Next steps" list of suggested follow-up tool calls when present.
+     * Follow-ups are phrased as concrete actions the model can take without
+     * asking the user for more information.
+     */
+    toUserMessage() {
+        const parts = [this.message];
+        if (this.hint)
+            parts.push("", this.hint);
+        if (this.followUps && this.followUps.length > 0) {
+            parts.push("", "Next steps:");
+            for (const step of this.followUps) {
+                parts.push(`• ${step}`);
+            }
+        }
+        return parts.join("\n");
+    }
+}
+export class WanderlogAuthError extends WanderlogError {
+    constructor(message = "Wanderlog session invalid or expired") {
+        super(message, "auth_expired", {
+            hint: "Capture a fresh connect.sid cookie from wanderlog.com DevTools (Application → Cookies) and update WANDERLOG_COOKIE in your MCP config.",
+            followUps: [
+                "Ask the user to refresh WANDERLOG_COOKIE in the MCP config, then restart the server.",
+            ],
+        });
+        this.name = "WanderlogAuthError";
+    }
+}
+export class WanderlogNotFoundError extends WanderlogError {
+    constructor(resource, identifier) {
+        const id = identifier ? ` '${identifier}'` : "";
+        const res = resource.toLowerCase();
+        const options = res === "trip"
+            ? {
+                hint: "Use wanderlog_list_trips to see available trips.",
+                followUps: [
+                    "Call wanderlog_list_trips to find the correct trip_key, then retry this tool with that key.",
+                ],
+            }
+            : res === "place"
+                ? {
+                    hint: "Try a more specific name or use wanderlog_search_places to find the exact place.",
+                    followUps: [
+                        "Call wanderlog_search_places with a broader query to see candidates.",
+                        "Retry this tool with a more specific place name (include the city or neighborhood).",
+                    ],
+                }
+                : res === "guide"
+                    ? {
+                        hint: "Use wanderlog_search_guides to find a valid guide_key for a destination.",
+                        followUps: [
+                            "Call wanderlog_search_guides with a destination to discover available guides.",
+                        ],
+                    }
+                    : {};
+        super(`${resource}${id} not found`, "not_found", options);
+        this.name = "WanderlogNotFoundError";
+    }
+}
+export class WanderlogValidationError extends WanderlogError {
+    constructor(message, hintOrOptions) {
+        super(message, "validation", hintOrOptions);
+        this.name = "WanderlogValidationError";
+    }
+}
+export class WanderlogNetworkError extends WanderlogError {
+    constructor(message) {
+        super(message, "network", {
+            hint: "Check your internet connection and that wanderlog.com is reachable.",
+            followUps: ["Retry the same tool call in a moment."],
+        });
+        this.name = "WanderlogNetworkError";
+    }
+}
+//# sourceMappingURL=errors.js.map
