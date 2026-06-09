@@ -21,6 +21,12 @@ type CacheEntry = {
 export class TripCache {
   private readonly entries = new Map<string, CacheEntry>();
   private readonly subscribing = new Map<string, Promise<CacheEntry>>();
+  /**
+   * Trips whose client listeners are already registered. subscribeAndCache
+   * can run again for the same trip after invalidate(); registering the
+   * remoteOp listener twice would double-apply every incoming op.
+   */
+  private readonly wired = new Set<string>();
 
   constructor(
     private readonly rest: RestClient,
@@ -64,18 +70,37 @@ export class TripCache {
     const entry: CacheEntry = { snapshot, version: client.version, geos };
     this.entries.set(tripKey, entry);
 
-    client.on("remoteOp", (ops: Json0Op[], version: number) => {
-      const current = this.entries.get(tripKey);
-      if (!current) return;
-      try {
-        current.snapshot = applyOp(current.snapshot, ops);
-        current.version = version;
-      } catch {
-        // If a remote op fails to apply to our snapshot, our view is stale.
-        // Drop the entry; next get() re-subscribes from a fresh snapshot.
-        this.entries.delete(tripKey);
-      }
-    });
+    if (!this.wired.has(tripKey)) {
+      this.wired.add(tripKey);
+
+      client.on("remoteOp", (ops: Json0Op[], version: number) => {
+        const current = this.entries.get(tripKey);
+        if (!current) return;
+        try {
+          current.snapshot = applyOp(current.snapshot, ops);
+          current.version = version;
+        } catch {
+          // If a remote op fails to apply to our snapshot, our view is stale.
+          // Drop the entry; next get() re-subscribes from a fresh snapshot.
+          this.entries.delete(tripKey);
+        }
+      });
+
+      // After a reconnect the client resubscribed and holds a fresh server
+      // snapshot; ops may have been missed while the connection was down, so
+      // replace our copy instead of patching it.
+      client.on("reconnected", () => {
+        const current = this.entries.get(tripKey);
+        const fresh = client.currentSnapshot;
+        if (!current) return;
+        if (fresh) {
+          current.snapshot = fresh;
+          current.version = client.version;
+        } else {
+          this.entries.delete(tripKey);
+        }
+      });
+    }
 
     return entry;
   }

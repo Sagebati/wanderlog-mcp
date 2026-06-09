@@ -75,6 +75,11 @@ export class ShareDBClient extends EventEmitter {
     { resolve: () => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
   >();
   private connectPromise?: Promise<void>;
+  private heartbeatTimer?: NodeJS.Timeout;
+  private pongTimer?: NodeJS.Timeout;
+
+  private static readonly HEARTBEAT_INTERVAL_MS = 30_000;
+  private static readonly PONG_TIMEOUT_MS = 10_000;
 
   constructor(
     private readonly config: Config,
@@ -145,8 +150,16 @@ export class ShareDBClient extends EventEmitter {
         this.handleFrame(msg as Frame & { error?: unknown }, handshakeTimeout, resolve);
       });
 
+      ws.on("pong", () => {
+        if (this.pongTimer) {
+          clearTimeout(this.pongTimer);
+          this.pongTimer = undefined;
+        }
+      });
+
       ws.on("close", (code: number) => {
         clearTimeout(handshakeTimeout);
+        this.stopHeartbeat();
         const wasSubscribed = this.subscribed;
         this.handshakeComplete = false;
         this.subscribed = false;
@@ -231,6 +244,7 @@ export class ShareDBClient extends EventEmitter {
       this.handshakeComplete = true;
       clearTimeout(handshakeTimeout);
       this.reconnectAttempts = 0;
+      this.startHeartbeat();
       const hs = frame as HandshakeAckFrame;
       if (!this.sessionId && hs.id) this.sessionId = hs.id;
       connectResolve();
@@ -284,6 +298,40 @@ export class ShareDBClient extends EventEmitter {
     }
   }
 
+  /**
+   * WS-level keepalive. Idle connections through NATs and load balancers can
+   * die without a close frame; the socket then looks OPEN forever while every
+   * send goes nowhere and no remote ops arrive (stale reads + submit
+   * timeouts). Ping every 30s; a missed pong means the connection is dead —
+   * terminate() forces the close event, which drives the normal
+   * reconnect/resubscribe path.
+   */
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (this.pongTimer) return; // previous ping still unanswered
+      ws.ping();
+      this.pongTimer = setTimeout(() => {
+        this.pongTimer = undefined;
+        ws.terminate();
+      }, ShareDBClient.PONG_TIMEOUT_MS);
+    }, ShareDBClient.HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+    if (this.pongTimer) {
+      clearTimeout(this.pongTimer);
+      this.pongTimer = undefined;
+    }
+  }
+
   private scheduleReconnect(resubscribe: boolean): void {
     const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30_000);
     this.reconnectAttempts += 1;
@@ -314,7 +362,14 @@ export class ShareDBClient extends EventEmitter {
   async subscribe(): Promise<TripPlan> {
     await this.connect();
 
-    if (this.subscribed && this.snapshot) return this.snapshot;
+    if (
+      this.subscribed &&
+      this.snapshot &&
+      this.ws?.readyState === WebSocket.OPEN
+    ) {
+      return this.snapshot;
+    }
+    this.subscribed = false;
 
     const ack = await new Promise<SubscribeAckFrame>((resolve, reject) => {
       this.subscribePending = { resolve, reject };
@@ -371,6 +426,11 @@ export class ShareDBClient extends EventEmitter {
         if (this.pendingOps.has(seq)) {
           this.pendingOps.delete(seq);
           reject(new WanderlogError("Submit op timeout", "submit_timeout"));
+          // A missed ack almost always means the connection is dead (zombie
+          // socket). Terminate so the close event fires and the reconnect/
+          // resubscribe path restores a working connection for the next op,
+          // instead of every subsequent submit timing out the same way.
+          this.ws?.terminate();
         }
       }, 10_000);
       this.pendingOps.set(seq, { resolve, reject, timer });
@@ -390,6 +450,7 @@ export class ShareDBClient extends EventEmitter {
   close(): void {
     this.closedByUser = true;
     this.subscribed = false;
+    this.stopHeartbeat();
     this.failAllPending(new WanderlogError("Client closed", "ws_closed"));
     this.ws?.close();
   }
