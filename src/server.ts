@@ -51,6 +51,11 @@ import {
   listTripsInputSchema,
 } from "./tools/list-trips.js";
 import {
+  movePlace,
+  movePlaceDescription,
+  movePlaceInputSchema,
+} from "./tools/move-place.js";
+import {
   removePlace,
   removePlaceDescription,
   removePlaceInputSchema,
@@ -286,6 +291,16 @@ export function buildServer(ctx: AppContext): McpServer {
     },
     requireAuth(ctx, async (args) =>
       addExpense(ctx, args as Parameters<typeof addExpense>[1])),
+  );
+
+  server.registerTool(
+    "wanderlog_move_place",
+    {
+      title: "Move or reorder a place in a Wanderlog trip",
+      description: movePlaceDescription,
+      inputSchema: movePlaceInputSchema,
+    },
+    requireAuth(ctx, async (args) => movePlace(ctx, args as Parameters<typeof movePlace>[1])),
   );
 
   server.registerTool(
